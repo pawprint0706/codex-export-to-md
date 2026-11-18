@@ -12,7 +12,7 @@ Codex CLI 세션 기록을 프로젝트 폴더별 Markdown으로 내보내고, �
 
 Codex CLI는 세션 기록을 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` 형태로 저장합니다. 이 도구는 표준 경로와 Orca 앱의 codex-home 경로를 모두 탐색해 세션을 수집하고, 같은 세션은 중복 제거한 뒤, 당시 작업 폴더(cwd)를 기준으로 프로젝트별로 묶어 읽기 좋은 Markdown으로 변환합니다.
 
-함께 생성되는 `viewer.html`은 외부 라이브러리 없이 동작하는 단일 파일 웹 뷰어로, 내보난 `projects` 폴더를 열어 대화를 탐색할 수 있습니다.
+함께 생성되는 `viewer.html`은 외부 라이브러리 없이 동작하는 단일 파일 웹 뷰어로, 내보낸 `projects` 폴더를 열어 대화를 탐색할 수 있습니다.
 
 ### 누락 없이 백업하기
 
@@ -32,7 +32,7 @@ python codex_export.py --project 'D:\DEV\WEB\suho-kakao-relay' --include-tool-ou
 
 ### 주요 기능
 
-- **세션 소스 자동 탐색** — 표준 `~/.codex/sessions` 경로와 Orca 경로(`~/.codex-*/sessions`, `%APPDATA%\\Orca\\codex-runtime-home`, `%APPDATA%\\Orca\\codex-accounts`)를 모두 탐색합니다.
+- **세션 소스 자동 탐색** — 표준 `~/.codex`, `CODEX_HOME` 및 Orca 경로(`~/.codex-*`, `%APPDATA%\\Orca\\codex-runtime-home`, `%APPDATA%\\Orca\\codex-accounts`)에서 `sessions`와 `archived_sessions`를 탐색합니다.
 - **중복 제거** — 동일한 스레드 `id`(없으면 `session_id`)를 가진 파일은 가장 큰 파일 하나를 Markdown에 사용합니다. 원본 백업에는 모든 사본을 보존합니다.
 - **프로젝트별 정리** — 세션을 당시 작업 폴더(cwd) 기준으로 그룹화하고, 폴더명이 겹치면 상위 경로를 붙여 구분합니다.
 - **읽기 좋은 Markdown** — 사용자/Codex 발화, 진행 메모(코멘터리), 도구 호출(접기 가능한 `<details>`), 세션 메타(시작 시각, 모델, Git 브랜치·커밋·저장소, CLI 버전, 세션 ID)를 정리해 담습니다.
@@ -68,7 +68,7 @@ python codex_export.py --no-viewer
 
 | 옵션 | 설명 |
 |---|---|
-| `--sessions-dir DIR` | 세션 JSONL 폴더. 여러 번 지정 가능. 미지정 시 표준 `~/.codex` + Orca 경로를 자동 탐색합니다. |
+| `--sessions-dir DIR` | 세션 JSONL 폴더. 여러 번 지정 가능. 미지정 시 표준 `~/.codex`, `CODEX_HOME` 및 Orca 경로에서 활성·보관 세션을 자동 탐색합니다. |
 | `-o, --output DIR` | 내보낼 폴더. 기본값: `./codex_export` |
 | `--include-tool-output` | 도구 호출(쉘 명령 등)의 실행 출력도 포함합니다. 기본값은 미포함입니다. |
 | `--no-viewer` | 웹 뷰어(`viewer.html`) 생성을 생략합니다. |
@@ -81,25 +81,29 @@ python codex_export.py --no-viewer
 ```
 codex_export/
 ├── viewer.html              # 단일 파일 웹 뷰어
+├── backup_manifest.json     # --backup-raw 사용 시: 출처, SHA-256, 세션 목록
+├── raw/                     # --backup-raw 사용 시: 원본 JSONL 사본 및 SQLite 스냅샷
 └── projects/
     ├── README.md            # 전체 개요 (프로젝트별 세션 수, 기간)
     └── <프로젝트 폴더>/
         ├── README.md        # 프로젝트별 세션 목록
         ├── assets/          # 대화에서 추출한 첨부 이미지
-        └── <YYYY-MM-DD_HHMMSS>_<제목>.md   # 세션 대화 기록
+        └── <YYYY-MM-DD_HHMMSS>_<ID 접미사>_<제목>.md   # 세션 대화 기록
 ```
 
 ### 세션 Markdown 구성
 
 각 세션 파일은 다음과 같이 구성됩니다.
 
-- 첫 사용자 메시지에서 추출한 제목과 출처(원본 JSONL 경로)
-- 메타 정보 표: 시작 시각, 프로젝트(cwd), Git 브랜치·커밋·저장소, 모델, CLI 버전, 세션 ID
+- `/resume` 제목(없으면 첫 사용자 메시지에서 추출한 제목)과 출처(원본 JSONL 경로). 파일명의 제목은 첫 사용자 메시지를 기준으로 합니다.
+- 메타 정보 표: 시작 시각, Codex 제목, 부모 세션(있는 경우), 프로젝트(cwd), Git 브랜치·커밋·저장소, 모델, CLI 버전, 세션 ID
 - `#### 🧑 사용자` / `#### 🤖 Codex` 발화와 타임스탬프
 - `> 💬 진행 메모`로 표시되는 코멘터리(중간 진행 메시지)
-- 도구 호출은 `<details>`로 접힘, `--include-tool-output` 사용 시 실행 출력 포함(30,000자 초과 시 잘림)
+- 도구 호출은 `<details>`로 접힘, `--include-tool-output` 사용 시 실행 출력 포함(기본 30,000자, `--max-output-chars 0`으로 제한 해제)
 - 컨텍스트 압축(compaction)이 있던 지점에는 안내 문구 표시
-- `<environment_context>` 블록과 ANSI 이스케이프 시퀀스는 자동으로 정리
+- SQLite에만 있는 사용자/Codex 메시지는 출처를 명시한 별도 보완 구역에 표시
+- 에이전트 간 메시지와 암호화된 본문이 있다는 안내 표시
+- `<environment_context>`만 있는 사용자 메시지는 제외하고, 도구 출력의 ANSI 이스케이프 시퀀스는 정리
 
 ### 웹 뷰어 사용 방법
 
@@ -117,10 +121,26 @@ A Python script that exports Codex CLI session logs into per-project Markdown an
 
 The generated `viewer.html` is a dependency-free, single-file web viewer for browsing the exported `projects` folder.
 
+### Backing up without omissions
+
+```powershell
+python codex_export.py --project 'D:\DEV\WEB\suho-kakao-relay' --include-tool-output --max-output-chars 0 --backup-raw -o 'backups/suho-kakao-relay'
+```
+
+- `--project` selects a working directory and its subdirectories. Windows `\\?\` prefixes, slash styles, and case differences are normalized.
+- Automatic discovery includes `sessions` and `archived_sessions` under `CODEX_HOME`, the standard home, and Orca homes. For records from another PC or WSL, copy the relevant folders and add them with `--sessions-dir`.
+- The unique thread `id` takes precedence. Child agents can share their parent's `session_id`, so using that field alone would incorrectly remove their records as duplicates.
+- Adjacent `state_*.sqlite` databases supply `/resume` titles. User/Codex messages found only in `thread_history_*.sqlite` are placed in a separate supplement. Threads with SQLite records but no JSONL file are not automatically reconstructed.
+- `--max-output-chars 0` removes the Markdown tool output length limit. It cannot recover already-truncated output or decrypt encrypted content into plaintext.
+- `--backup-raw` saves every selected original JSONL copy, including duplicates; full snapshots of that home's `state_*.sqlite` and `thread_history_*.sqlite` databases; and a SHA-256 inventory in `backup_manifest.json`. Database snapshots also include other projects. The SQLite backup API includes committed WAL data.
+- Markdown is a readable conversion. Keep `raw/` as well to preserve messages from before compaction, unsupported events, and encrypted agent messages. Attachments referenced only by external file paths and credentials are not included in this backup.
+- Active sessions can keep changing. For the final backup, wait until the target session's response finishes and use a new output folder. JSONL files and multiple databases are not captured at one atomic point in time.
+- The exporter warns if a session has metadata but no conversation body in either JSONL or SQLite. Such records require an earlier backup or originals from another environment.
+
 ### Features
 
-- **Automatic session discovery** — scans the standard `~/.codex/sessions` path plus Orca paths (`~/.codex-*/sessions`, `%APPDATA%\\Orca\\codex-runtime-home`, `%APPDATA%\\Orca\\codex-accounts`).
-- **Deduplication** — uses the unique thread `id` (falling back to `session_id`), preserving child threads that share their parent's session ID. Markdown uses the largest copy; raw backups keep all copies.
+- **Automatic session discovery** — scans `sessions` and `archived_sessions` under the standard `~/.codex` home, `CODEX_HOME`, and Orca paths (`~/.codex-*`, `%APPDATA%\\Orca\\codex-runtime-home`, `%APPDATA%\\Orca\\codex-accounts`).
+- **Deduplication** — Markdown uses the largest file for each unique thread `id` (falling back to `session_id`). Raw backups preserve all copies.
 - **Per-project organization** — sessions are grouped by their working directory (cwd); conflicting folder names get parent-path prefixes.
 - **Readable Markdown** — user/Codex messages, commentary (progress notes), tool calls (collapsible `<details>`), and session metadata (start time, model, Git branch/commit/repo, CLI version, session ID).
 - **Image extraction** — base64 inline images in conversations are saved as files under `assets/` and referenced from Markdown.
@@ -153,40 +173,44 @@ python codex_export.py --no-viewer
 
 ### Options
 
-For a local backup, use `--project CWD --include-tool-output --max-output-chars 0 --backup-raw`.
-Discovery includes archived sessions and `CODEX_HOME`. Adjacent SQLite history supplies resume titles and visible messages missing from JSONL in a separate supplement. Raw backups preserve all selected JSONL copies and full state/history SQLite snapshots, including committed WAL data, with SHA-256 hashes in `backup_manifest.json`. Database snapshots include other projects. External attachment files and credentials are not copied. Encrypted or already-truncated content cannot be recovered as plaintext by this exporter. Threads with no JSONL file are not automatically reconstructed from SQLite. Finish active turns before taking the final backup; multiple files/databases are not captured as one atomic transaction.
-
 | Option | Description |
 |---|---|
-| `--sessions-dir DIR` | Session JSONL folder. Repeatable. If omitted, standard `~/.codex` + Orca paths are discovered automatically. |
+| `--sessions-dir DIR` | Session JSONL folder. Repeatable. If omitted, active and archived sessions are discovered under the standard `~/.codex` home, `CODEX_HOME`, and Orca paths. |
 | `-o, --output DIR` | Output folder. Default: `./codex_export` |
 | `--include-tool-output` | Also include tool call execution output (shell commands, etc.). Off by default. |
 | `--no-viewer` | Skip generating the web viewer (`viewer.html`). |
+| `--project CWD` | Select sessions from a working directory and its subdirectories. |
+| `--backup-raw` | Preserve original copies, SQLite snapshots, and a SHA-256 inventory. |
+| `--max-output-chars N` | Tool output length limit. Default: 30,000 characters; `0` means unlimited. |
 
 ### Output layout
 
 ```
 codex_export/
 ├── viewer.html              # single-file web viewer
+├── backup_manifest.json     # with --backup-raw: sources, SHA-256 hashes, session list
+├── raw/                     # with --backup-raw: original JSONL copies and SQLite snapshots
 └── projects/
     ├── README.md            # global overview (session counts, date ranges)
     └── <project folder>/
         ├── README.md        # per-project session list
         ├── assets/          # extracted attachment images
-        └── <YYYY-MM-DD_HHMMSS>_<title>.md   # session transcript
+        └── <YYYY-MM-DD_HHMMSS>_<ID suffix>_<title>.md   # session transcript
 ```
 
 ### Session Markdown structure
 
 Each session file contains:
 
-- A title derived from the first user message, plus the source (original JSONL path)
-- A metadata table: start time, project (cwd), Git branch/commit/repo, model, CLI version, session ID
+- The `/resume` title (falling back to the first user message), plus the source (original JSONL path). The title in the filename is derived from the first user message.
+- A metadata table: start time, Codex title, parent session (when available), project (cwd), Git branch/commit/repo, model, CLI version, session ID
 - `#### 🧑 User` / `#### 🤖 Codex` messages with timestamps
 - Commentary (intermediate progress messages) shown as `> 💬 Progress note`
-- Tool calls rendered as collapsible `<details>`; with `--include-tool-output`, execution output is included (truncated past 30,000 characters)
+- Tool calls rendered as collapsible `<details>`; with `--include-tool-output`, execution output is included (default limit: 30,000 characters; use `--max-output-chars 0` to remove it)
 - A notice wherever context compaction occurred
-- Automatic cleanup of `<environment_context>` blocks and ANSI escape sequences
+- A separate supplement identifying user/Codex messages found only in SQLite
+- Inter-agent messages and notices identifying encrypted message bodies
+- User messages containing only `<environment_context>` are omitted; ANSI escape sequences are removed from tool output
 
 ### Using the web viewer
 
