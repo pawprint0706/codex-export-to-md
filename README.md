@@ -14,10 +14,26 @@ Codex CLI는 세션 기록을 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` 형
 
 함께 생성되는 `viewer.html`은 외부 라이브러리 없이 동작하는 단일 파일 웹 뷰어로, 내보난 `projects` 폴더를 열어 대화를 탐색할 수 있습니다.
 
+### 누락 없이 백업하기
+
+```powershell
+python codex_export.py --project 'D:\DEV\WEB\suho-kakao-relay' --include-tool-output --max-output-chars 0 --backup-raw -o 'backups/suho-kakao-relay'
+```
+
+- `--project`는 작업 폴더와 그 하위 폴더를 선택합니다. Windows의 `\\?\` 접두사, 슬래시 및 대소문자 차이를 정규화합니다.
+- 기본 탐색은 `CODEX_HOME`, 표준 및 Orca 홈의 `sessions`와 `archived_sessions`를 포함합니다. 다른 PC/WSL의 기록은 해당 폴더를 복사하여 `--sessions-dir`로 추가해야 합니다.
+- 스레드 고유 `id`를 우선 사용합니다. 하위 에이전트는 부모와 `session_id`가 같을 수 있으므로 이를 중복으로 제거하면 안 됩니다.
+- 인접한 `state_*.sqlite`에서 `/resume` 제목을 읽고, `thread_history_*.sqlite`에만 있는 사용자/Codex 메시지를 별도 보완 구역에 기록합니다. SQLite만 존재하고 JSONL 파일이 없는 스레드를 자동으로 생성하지는 않습니다.
+- `--max-output-chars 0`은 Markdown의 도구 출력 길이 제한을 해제합니다. 원본이 이미 잘린 출력이나 암호화된 내용까지 평문으로 복구하지는 않습니다.
+- `--backup-raw`는 중복 사본을 포함한 선택된 원본 JSONL 전체, 해당 홈의 `state_*.sqlite`와 `thread_history_*.sqlite` 전체 스냅샷, SHA-256 목록인 `backup_manifest.json`을 저장합니다. DB 스냅샷은 다른 프로젝트의 기록도 포함합니다. SQLite backup API로 커밋된 WAL 내용도 포함합니다.
+- Markdown은 읽기용 변환본입니다. 압축 전 메시지, 지원하지 않는 이벤트, 암호화된 에이전트 메시지 등을 보존하려면 `raw/`도 함께 보관하세요. 외부 파일 경로로만 참조된 첨부파일과 인증 정보는 이 백업에 포함되지 않습니다.
+- 실행 중인 세션은 계속 바뀔 수 있습니다. 최종 백업은 대상 세션의 응답이 끝난 뒤 새 출력 폴더에 실행하세요. JSONL과 여러 DB 전체를 하나의 원자적 시점으로 묶는 기능은 없습니다.
+- 메타데이터만 있고 JSONL/SQLite 어디에도 본문이 없으면 경고합니다. 이 경우 이전 백업이나 다른 환경의 원본이 필요합니다.
+
 ### 주요 기능
 
 - **세션 소스 자동 탐색** — 표준 `~/.codex/sessions` 경로와 Orca 경로(`~/.codex-*/sessions`, `%APPDATA%\\Orca\\codex-runtime-home`, `%APPDATA%\\Orca\\codex-accounts`)를 모두 탐색합니다.
-- **중복 제거** — 동일한 세션 ID를 가진 파일은 가장 큰 파일 하나만 사용합니다.
+- **중복 제거** — 동일한 스레드 `id`(없으면 `session_id`)를 가진 파일은 가장 큰 파일 하나를 Markdown에 사용합니다. 원본 백업에는 모든 사본을 보존합니다.
 - **프로젝트별 정리** — 세션을 당시 작업 폴더(cwd) 기준으로 그룹화하고, 폴더명이 겹치면 상위 경로를 붙여 구분합니다.
 - **읽기 좋은 Markdown** — 사용자/Codex 발화, 진행 메모(코멘터리), 도구 호출(접기 가능한 `<details>`), 세션 메타(시작 시각, 모델, Git 브랜치·커밋·저장소, CLI 버전, 세션 ID)를 정리해 담습니다.
 - **첨부 이미지 추출** — 대화에 포함된 base64 인라인 이미지를 `assets/` 폴더에 파일로 저장하고 Markdown에서 참조합니다.
@@ -56,6 +72,9 @@ python codex_export.py --no-viewer
 | `-o, --output DIR` | 내보낼 폴더. 기본값: `./codex_export` |
 | `--include-tool-output` | 도구 호출(쉘 명령 등)의 실행 출력도 포함합니다. 기본값은 미포함입니다. |
 | `--no-viewer` | 웹 뷰어(`viewer.html`) 생성을 생략합니다. |
+| `--project CWD` | 특정 작업 폴더와 하위 폴더의 세션만 선택합니다. |
+| `--backup-raw` | 원본 사본, SQLite 스냅샷 및 SHA-256 검증 목록을 보관합니다. |
+| `--max-output-chars N` | 도구 출력 길이 제한. 기본 30,000자, `0`은 무제한입니다. |
 
 ### 출력 구조
 
@@ -101,7 +120,7 @@ The generated `viewer.html` is a dependency-free, single-file web viewer for bro
 ### Features
 
 - **Automatic session discovery** — scans the standard `~/.codex/sessions` path plus Orca paths (`~/.codex-*/sessions`, `%APPDATA%\\Orca\\codex-runtime-home`, `%APPDATA%\\Orca\\codex-accounts`).
-- **Deduplication** — for files sharing the same session ID, only the largest file is used.
+- **Deduplication** — uses the unique thread `id` (falling back to `session_id`), preserving child threads that share their parent's session ID. Markdown uses the largest copy; raw backups keep all copies.
 - **Per-project organization** — sessions are grouped by their working directory (cwd); conflicting folder names get parent-path prefixes.
 - **Readable Markdown** — user/Codex messages, commentary (progress notes), tool calls (collapsible `<details>`), and session metadata (start time, model, Git branch/commit/repo, CLI version, session ID).
 - **Image extraction** — base64 inline images in conversations are saved as files under `assets/` and referenced from Markdown.
@@ -133,6 +152,9 @@ python codex_export.py --no-viewer
 ```
 
 ### Options
+
+For a local backup, use `--project CWD --include-tool-output --max-output-chars 0 --backup-raw`.
+Discovery includes archived sessions and `CODEX_HOME`. Adjacent SQLite history supplies resume titles and visible messages missing from JSONL in a separate supplement. Raw backups preserve all selected JSONL copies and full state/history SQLite snapshots, including committed WAL data, with SHA-256 hashes in `backup_manifest.json`. Database snapshots include other projects. External attachment files and credentials are not copied. Encrypted or already-truncated content cannot be recovered as plaintext by this exporter. Threads with no JSONL file are not automatically reconstructed from SQLite. Finish active turns before taking the final backup; multiple files/databases are not captured as one atomic transaction.
 
 | Option | Description |
 |---|---|

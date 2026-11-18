@@ -27,9 +27,13 @@ md 파일을 실행 시점에 직접 읽어(폴더 선택) 파싱하여 표시�
 import argparse
 import base64
 import json
+import hashlib
 import os
 import re
+import shutil
+import sqlite3
 import sys
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -128,7 +132,7 @@ def tool_command_text(payload):
                 return raw.strip(), ""
             if isinstance(args, dict):
                 cmd = args.get("command") or args.get("cmd") or args.get("script") or ""
-                return str(cmd), str(args.get("workdir") or "")
+                return str(cmd) if cmd else json.dumps(args, ensure_ascii=False, indent=2), str(args.get("workdir") or "")
             return json.dumps(args, ensure_ascii=False, indent=2), ""
         return json.dumps(raw, ensure_ascii=False, indent=2), ""
     raw = payload.get("input") or ""
@@ -148,14 +152,14 @@ def load_session(path):
         return None
 
     def append_message(role, text, images, msg_id, dt, phase=None):
-        if not text.strip():
+        if not text.strip() and not images:
             return False
         if msg_id and msg_id in seen_ids:
             return False
         if msg_id:
             seen_ids.add(msg_id)
         if role == "user":
-            if not strip_env_context(text):
+            if not strip_env_context(text) and not images:
                 return False
             events.append({"kind": "user", "dt": dt, "text": text, "images": images})
         elif role == "assistant":
@@ -177,6 +181,8 @@ def load_session(path):
 
         if rtype == "session_meta":
             meta.update(payload)
+            # A child thread can share session_id with its parent; id is unique.
+            meta["session_id"] = meta.get("id") or meta.get("session_id")
             if not meta.get("timestamp") and dt:
                 meta["timestamp"] = dt
             continue
@@ -210,6 +216,12 @@ def load_session(path):
                 dt,
                 payload.get("phase"),
             )
+        elif ptype == "agent_message":
+            txt = content_text(payload.get("content"))
+            if any(i.get("type") == "encrypted_content" for i in payload.get("content") or [] if isinstance(i, dict)):
+                txt += "\n[암호화된 메시지 본문: 원본 JSONL에 보존됨]"
+            events.append({"kind": "agent_message", "dt": dt, "text": txt,
+                           "author": payload.get("author"), "recipient": payload.get("recipient")})
         elif ptype in ("function_call", "custom_tool_call"):
             cmd, workdir = tool_command_text(payload)
             events.append({
@@ -244,7 +256,10 @@ def discover_session_dirs():
     for acc in (roaming / "codex-accounts").glob("*/home/sessions"):
         if acc.is_dir():
             dirs.append(acc)
-    return dirs
+    if os.environ.get("CODEX_HOME"):
+        dirs.append(Path(os.environ["CODEX_HOME"]) / "sessions")
+    dirs += [d.parent / "archived_sessions" for d in list(dirs)]
+    return list(dict.fromkeys(d.resolve() for d in dirs if d.is_dir()))
 
 
 def source_label(root):
@@ -273,19 +288,110 @@ def load_all_sessions(session_dirs):
                 continue
             loaded["path"] = f
             loaded["source"] = label
+            loaded["source_paths"] = [f]
             sid = loaded["meta"].get("session_id")
             size = f.stat().st_size
             if sid:
                 prev = best.get(sid)
                 if prev is not None:
+                    paths = prev["source_paths"] + [f]
                     if size > prev["size"]:
                         best[sid] = {**loaded, "size": size}
+                    best[sid]["source_paths"] = paths
                     continue
                 best[sid] = {**loaded, "size": size}
             else:
                 sessions.append(loaded)
     sessions.extend(best.values())
     return sessions
+
+
+def normalized_cwd(value):
+    value = str(value or "").replace("/", "\\")
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return os.path.normcase(os.path.normpath(value)).rstrip("\\").lower()
+
+
+def supplement_history(sessions):
+    """Keep SQLite-only visible messages separate so their provenance is clear."""
+    for sess in sessions:
+        sid = sess["meta"].get("session_id")
+        known = {(ev["kind"], ev.get("text", "").strip()) for ev in sess["events"]}
+        extra = []
+        homes = dict.fromkeys(session_home(p) for p in sess["source_paths"])
+        for home in homes:
+            for state in sorted(home.glob("state_*.sqlite"), reverse=True):
+                with closing(sqlite3.connect(state.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                    columns = {r[1] for r in db.execute("PRAGMA table_info(threads)")}
+                    title_expr = "COALESCE(NULLIF(name,''),title)" if "name" in columns else "title"
+                    row = db.execute(f"SELECT {title_expr} FROM threads WHERE id=?", (sid,)).fetchone()
+                    if row and row[0]:
+                        sess["meta"].setdefault("title", row[0])
+                break
+            for history in home.glob("thread_history_*.sqlite"):
+                with closing(sqlite3.connect(history.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                    rows = db.execute(
+                        "SELECT created_at_ms,item_json FROM thread_items WHERE thread_id=? "
+                        "ORDER BY rollout_ordinal,created_at_ms", (sid,))
+                    for stamp, raw in rows:
+                        item = json.loads(raw)
+                        if item.get("type") == "userMessage":
+                            kind, txt = "user", content_text(item.get("content"))
+                        elif item.get("type") == "agentMessage":
+                            kind = "commentary" if item.get("phase") == "commentary" else "assistant"
+                            txt = item.get("text") or ""
+                        else:
+                            continue
+                        key = (kind, txt.strip())
+                        if txt.strip() and key not in known:
+                            known.add(key)
+                            extra.append({"kind": kind, "text": txt, "dt": datetime.fromtimestamp(stamp / 1000).astimezone() if stamp else None})
+        if extra:
+            sess["events"].append({"kind": "history_supplement"})
+            sess["events"].extend(extra)
+        sess["history_supplement_count"] = len(extra)
+
+
+def session_home(source):
+    base = next((p for p in source.parents if p.name in ("sessions", "archived_sessions")), source.parent)
+    return base.parent
+
+
+def backup_raw(sessions, out_dir):
+    """Preserve every copy, plus consistent SQLite snapshots (including WAL)."""
+    root = out_dir / "raw"
+    manifest = {"created_at": datetime.now().astimezone().isoformat(), "files": [], "sessions": []}
+    homes = {}
+    for sess in sessions:
+        sid = sess["meta"].get("session_id")
+        manifest["sessions"].append({"id": sid, "cwd": sess["meta"].get("cwd"),
+            "title": sess["meta"].get("title"), "filename": sess.get("filename"),
+            "events": len(sess["events"]), "sqlite_only_messages": sess.get("history_supplement_count", 0),
+            "has_conversation": any(e["kind"] in ("user", "assistant", "commentary") for e in sess["events"])})
+        for source in sess["source_paths"]:
+            # Find the sessions/archived_sessions root even for nested date folders.
+            base = next((p for p in source.parents if p.name in ("sessions", "archived_sessions")), source.parent)
+            home = base.parent
+            label = hashlib.sha256(str(home).encode()).hexdigest()[:12]
+            homes[home] = label
+            target = root / label / base.name / source.relative_to(base)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            manifest["files"].append({"source": str(source), "backup": target.relative_to(out_dir).as_posix(),
+                "sha256": hashlib.sha256(target.read_bytes()).hexdigest(), "bytes": target.stat().st_size})
+    for home, label in homes.items():
+        for pattern in ("state_*.sqlite", "thread_history_*.sqlite"):
+            for source in home.glob(pattern):
+                target = root / label / source.name
+                with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as src:
+                    with closing(sqlite3.connect(target)) as dst:
+                        src.backup(dst)
+                manifest["files"].append({"source": str(source), "backup": target.relative_to(out_dir).as_posix(),
+                    "sha256": hashlib.sha256(target.read_bytes()).hexdigest(), "bytes": target.stat().st_size})
+    (out_dir / "backup_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def title_for(events):
@@ -334,6 +440,10 @@ def session_start(sess):
 
 def build_meta_rows(meta, start):
     rows = [("시작", fmt_time_long(start))]
+    if meta.get("title"):
+        rows.append(("Codex 제목", meta["title"]))
+    if meta.get("parent_thread_id"):
+        rows.append(("부모 세션", meta["parent_thread_id"]))
     if meta.get("cwd"):
         rows.append(("프로젝트", f"`{meta['cwd']}`"))
     git = meta.get("git") or {}
@@ -355,9 +465,9 @@ def build_meta_rows(meta, start):
     return rows
 
 
-def render_session_markdown(sess, src_rel, include_tool_output):
+def render_session_markdown(sess, src_rel, include_tool_output, max_output_chars=MAX_OUTPUT_CHARS):
     meta, events, outputs = sess["meta"], sess["events"], sess["outputs"]
-    title = title_for(events)
+    title = meta.get("title") or title_for(events)
     start = session_start(sess)
     asset_names = sess.get("asset_names") or []
     asset_index = 0
@@ -418,8 +528,8 @@ def render_session_markdown(sess, src_rel, include_tool_output):
                 raw = outputs.get(ev.get("call_id")) if ev.get("call_id") else None
                 if raw:
                     cleaned = ANSI_RE.sub("", raw).strip()
-                    if len(cleaned) > MAX_OUTPUT_CHARS:
-                        cleaned = cleaned[:MAX_OUTPUT_CHARS] + "\n...(출력 생략)"
+                    if max_output_chars and len(cleaned) > max_output_chars:
+                        cleaned = cleaned[:max_output_chars] + "\n...(출력 생략)"
                     out.append("**출력:**")
                     out.append("")
                     out.append(fence(cleaned))
@@ -429,6 +539,11 @@ def render_session_markdown(sess, src_rel, include_tool_output):
         elif kind == "compaction":
             out.append("> ⚠️ 대화가 압축되어 요약되었습니다. 아래 메시지들은 압축 전 기록에서 복원되었습니다.")
             out.append("")
+        elif kind == "history_supplement":
+            out.extend(["### SQLite 대화 기록에서 보완한 메시지", "",
+                        "> 아래 메시지는 JSONL에 없어 SQLite에서 보완했습니다. 원래 대화 내 위치는 별도 확인이 필요합니다.", ""])
+        elif kind == "agent_message":
+            out.extend([f"#### 에이전트 메시지 · {ev.get('author')} → {ev.get('recipient')}", "", ev["text"], ""])
 
     if not events:
         out.append("이 세션에는 기록된 대화가 없습니다.")
@@ -455,7 +570,7 @@ def build_project_readme(folder_name, cwd, sessions):
     for i, sess in enumerate(sessions, 1):
         start = session_start(sess)
         stamp = start.strftime("%Y-%m-%d %H:%M") if start else "-"
-        title = title_for(sess["events"])
+        title = sess["meta"].get("title") or title_for(sess["events"])
         out.append(f"| {stamp} | [{title}](./{sess['filename']}) |")
     out.append("")
     return "\n".join(out)
@@ -515,7 +630,12 @@ def main():
     parser.add_argument("-o", "--output", default="codex_export", help="내보낼 폴더 (기본: ./codex_export)")
     parser.add_argument("--include-tool-output", action="store_true", help="도구 실행 출력 포함")
     parser.add_argument("--no-viewer", action="store_true", help="웹 뷰어 생성 생략")
+    parser.add_argument("--project", metavar="CWD", help="특정 작업 폴더 및 하위 폴더의 세션만 내보내기")
+    parser.add_argument("--backup-raw", action="store_true", help="모든 원본 JSONL 사본과 SQLite 스냅샷 및 검증 목록 보관")
+    parser.add_argument("--max-output-chars", type=int, default=MAX_OUTPUT_CHARS, help="도구 출력 최대 글자 수 (0: 제한 없음)")
     args = parser.parse_args()
+    if args.max_output_chars < 0:
+        parser.error("--max-output-chars는 0 이상이어야 합니다")
 
     if args.sessions_dir:
         session_dirs = [Path(p) for p in args.sessions_dir]
@@ -537,11 +657,19 @@ def main():
 
     sessions = load_all_sessions(session_dirs)
     print(f"세션 파일 {len(files)}개 발견, 고유 세션 {len(sessions)}개 로드")
+    if args.project:
+        project = normalized_cwd(args.project)
+        sessions = [s for s in sessions if normalized_cwd(s["meta"].get("cwd")) == project
+                    or normalized_cwd(s["meta"].get("cwd")).startswith(project + "\\")]
+    if not sessions:
+        print("조건에 맞는 세션이 없습니다.")
+        return 1
+    supplement_history(sessions)
 
     grouped = {}
     for sess in sessions:
         cwd = sess["meta"].get("cwd")
-        key = os.path.normcase(os.path.normpath(cwd.strip().rstrip("/\\"))) if cwd else None
+        key = normalized_cwd(cwd) if cwd else None
         grouped.setdefault(key, []).append(sess)
 
     folders = assign_folder_names(list(grouped))
@@ -562,6 +690,7 @@ def main():
             slug = INVALID_FS_CHARS.sub("_", title_for(sess["events"]))
             slug = re.sub(r"\s+", "_", slug)[:50].strip("_. ")
             stem = start.strftime("%Y-%m-%d_%H%M%S") if start else str(sess["path"].stem)[:16]
+            stem += "_" + str(sess["meta"].get("session_id") or hashlib.sha256(str(sess["path"]).encode()).hexdigest())[-12:]
             base = f"{stem}_{slug}" if slug else stem
             filename = f"{base}.md"
             if filename in used_names:
@@ -583,7 +712,7 @@ def main():
                 rel = os.path.relpath(sess["path"], next(d for d in session_dirs if str(sess["path"]).lower().startswith(str(d).lower())))
             except (StopIteration, ValueError):
                 rel = str(sess["path"])
-            md = render_session_markdown(sess, rel, args.include_tool_output)
+            md = render_session_markdown(sess, rel, args.include_tool_output, args.max_output_chars)
             with open(pdir / filename, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(md)
 
@@ -601,6 +730,14 @@ def main():
         viewer = build_viewer(out_dir)
         if viewer:
             print(f"뷰어: {viewer}")
+    if args.backup_raw:
+        backup_raw(sessions, out_dir)
+        print(f"원본 백업 및 검증 목록: {out_dir / 'backup_manifest.json'}")
+    empty = [s for s in sessions if not any(e["kind"] in ("user", "assistant", "commentary") for e in s["events"])]
+    if empty:
+        print(f"주의: 본문을 찾지 못한 세션 {len(empty)}개 (원본 메타데이터만 존재할 수 있음)")
+        for s in empty:
+            print(f"  {s['meta'].get('session_id')}: {s['path']}")
 
     print(f"완료: {len(sessions)}개 세션, {len(grouped)}개 프로젝트 -> {out_dir}")
     for p in project_infos:
